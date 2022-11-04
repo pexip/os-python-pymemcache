@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -e
+set -x
+
+CWD=$(pwd)
+for i in $(py3versions -vs) ; do
+	python${i} setup.py install --install-layout=deb --root ${CWD}/debian/tmp
+	PYTHONPATH=${CWD}/debian/tmp/usr/lib/python3/dist-packages \
+		python$i -m pytest -v pymemcache/test ; \
+done

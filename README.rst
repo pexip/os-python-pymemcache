@@ -49,9 +49,12 @@ See the documentation here: https://pymemcache.readthedocs.io/en/latest/
 Django
 ------
 
-If you're planning on using pymemcache with Django, you might be interested in
+Since version 3.2, Django has included a pymemcache-based cache backend.
+See `its documentation 
+<https://docs.djangoproject.com/en/stable/topics/cache/#memcached>`__.
+
+On older Django versions, you can use
 `django-pymemcache <https://github.com/django-pymemcache/django-pymemcache>`_.
-It provides a Django cache backend that is built on pymemcache.
 
 Comparison with Other Libraries
 ===============================
@@ -100,6 +103,9 @@ Mixpanel's Blog post about their memcached client for Python:
 
 Mixpanel's pure Python memcached client:
   https://github.com/mixpanel/memcache_client
+  
+Bye-bye python-memcached, hello pymemcache (migration guide)
+  https://jugmac00.github.io/blog/bye-bye-python-memcached-hello-pymemcache/
 
 Credits
 =======
@@ -129,6 +135,7 @@ Credits
 * `Moisés Guimarães de Medeiros <https://github.com/moisesguimaraes>`_
 * `Nick Pope <https://github.com/ngnpope>`_
 * `Hervé Beraud <https://github.com/4383>`_
+* `Martin Jørgensen <https://github.com/martinnj>`_
 
 We're Hiring!
 =============

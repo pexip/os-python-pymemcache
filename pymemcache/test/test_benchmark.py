@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import six
 import time
 import pytest
 
 try:
-    import pylibmc
+    import pylibmc  # type: ignore
+
     HAS_PYLIBMC = True
 except Exception:
     HAS_PYLIBMC = False
 
 try:
-    import memcache
+    import memcache  # type: ignore
+
     HAS_MEMCACHE = True
 except Exception:
     HAS_MEMCACHE = False
@@ -31,27 +32,30 @@ except Exception:
 
 try:
     import pymemcache.client
+
     HAS_PYMEMCACHE = True
 except Exception:
     HAS_PYMEMCACHE = False
 
 
-@pytest.fixture(params=[
-    "pylibmc",
-    "memcache",
-    "pymemcache",
-])
+@pytest.fixture(
+    params=[
+        "pylibmc",
+        "memcache",
+        "pymemcache",
+    ]
+)
 def client(request, host, port):
     if request.param == "pylibmc":
         if not HAS_PYLIBMC:
             pytest.skip("requires pylibmc")
-        client = pylibmc.Client(['{0}:{1}'.format(host, port)])
+        client = pylibmc.Client([f"{host}:{port}"])
         client.behaviors = {"tcp_nodelay": True}
 
     elif request.param == "memcache":
         if not HAS_MEMCACHE:
             pytest.skip("requires python-memcached")
-        client = memcache.Client(['{0}:{1}'.format(host, port)])
+        client = memcache.Client([f"{host}:{port}"])
 
     elif request.param == "pymemcache":
         if not HAS_PYMEMCACHE:
@@ -59,7 +63,7 @@ def client(request, host, port):
         client = pymemcache.client.Client((host, port))
 
     else:
-        pytest.skip("unknown library {0}".format(request.param))
+        pytest.skip(f"unknown library {request.param}")
 
     client.flush_all()
     return client
@@ -79,14 +83,16 @@ def benchmark(count, func, *args, **kwargs):
 
 @pytest.mark.benchmark()
 def test_bench_get(request, client, pairs, count):
-    key, value = six.next(six.iteritems(pairs))
+    key = "pymemcache_test:0"
+    value = pairs[key]
     client.set(key, value)
     benchmark(count, client.get, key)
 
 
 @pytest.mark.benchmark()
 def test_bench_set(request, client, pairs, count):
-    key, value = six.next(six.iteritems(pairs))
+    key = "pymemcache_test:0"
+    value = pairs[key]
     benchmark(count, client.set, key, value)
 
 
@@ -103,10 +109,10 @@ def test_bench_set_multi(request, client, pairs, count):
 
 @pytest.mark.benchmark()
 def test_bench_delete(request, client, pairs, count):
-    benchmark(count, client.delete, six.next(six.iterkeys(pairs)))
+    benchmark(count, client.delete, next(pairs))
 
 
 @pytest.mark.benchmark()
 def test_bench_delete_multi(request, client, pairs, count):
     # deleting missing key takes the same work client-side as real keys
-    benchmark(count, client.delete_multi, list(pairs))
+    benchmark(count, client.delete_multi, list(pairs.keys()))

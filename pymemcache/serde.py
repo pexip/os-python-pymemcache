@@ -12,23 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 import logging
+import pickle
+import zlib
+from functools import partial
 from io import BytesIO
-import six
-from six.moves import cPickle as pickle
-
-try:
-    long_type = long  # noqa
-except NameError:
-    long_type = None
-
 
 FLAG_BYTES = 0
 FLAG_PICKLE = 1 << 0
 FLAG_INTEGER = 1 << 1
 FLAG_LONG = 1 << 2
-FLAG_COMPRESSED = 1 << 3  # unused, to main compatibility with python-memcached
+FLAG_COMPRESSED = 1 << 3
 FLAG_TEXT = 1 << 4
 
 # Pickle protocol version (highest available to runtime)
@@ -49,16 +43,12 @@ def _python_memcache_serializer(key, value, pickle_version=None):
     if value_type is bytes:
         pass
 
-    elif value_type is six.text_type:
+    elif value_type is str:
         flags |= FLAG_TEXT
-        value = value.encode('utf8')
+        value = value.encode("utf8")
 
     elif value_type is int:
         flags |= FLAG_INTEGER
-        value = "%d" % value
-
-    elif six.PY2 and value_type is long_type:
-        flags |= FLAG_LONG
         value = "%d" % value
 
     else:
@@ -71,7 +61,7 @@ def _python_memcache_serializer(key, value, pickle_version=None):
     return value, flags
 
 
-def get_python_memcache_serializer(pickle_version=DEFAULT_PICKLE_VERSION):
+def get_python_memcache_serializer(pickle_version: int = DEFAULT_PICKLE_VERSION):
     """Return a serializer using a specific pickle version"""
     return partial(_python_memcache_serializer, pickle_version=pickle_version)
 
@@ -84,16 +74,13 @@ def python_memcache_deserializer(key, value, flags):
         return value
 
     elif flags & FLAG_TEXT:
-        return value.decode('utf8')
+        return value.decode("utf8")
 
     elif flags & FLAG_INTEGER:
         return int(value)
 
     elif flags & FLAG_LONG:
-        if six.PY3:
-            return int(value)
-        else:
-            return long_type(value)
+        return int(value)
 
     elif flags & FLAG_PICKLE:
         try:
@@ -101,13 +88,13 @@ def python_memcache_deserializer(key, value, flags):
             unpickler = pickle.Unpickler(buf)
             return unpickler.load()
         except Exception:
-            logging.info('Pickle error', exc_info=True)
+            logging.info("Pickle error", exc_info=True)
             return None
 
     return value
 
 
-class PickleSerde(object):
+class PickleSerde:
     """
     An object which implements the serialization/deserialization protocol for
     :py:class:`pymemcache.client.base.Client` and its descendants using the
@@ -124,7 +111,8 @@ class PickleSerde(object):
     For more details on the serialization protocol, see the class documentation
     for :py:class:`pymemcache.client.base.Client`
     """
-    def __init__(self, pickle_version=DEFAULT_PICKLE_VERSION):
+
+    def __init__(self, pickle_version: int = DEFAULT_PICKLE_VERSION) -> None:
         self._serialize_func = get_python_memcache_serializer(pickle_version)
 
     def serialize(self, key, value):
@@ -134,7 +122,56 @@ class PickleSerde(object):
         return python_memcache_deserializer(key, value, flags)
 
 
-class LegacyWrappingSerde(object):
+pickle_serde = PickleSerde()
+
+
+class CompressedSerde:
+    """
+    An object which implements the serialization/deserialization protocol for
+    :py:class:`pymemcache.client.base.Client` and its descendants with
+    configurable compression.
+    """
+
+    def __init__(
+        self,
+        compress=zlib.compress,
+        decompress=zlib.decompress,
+        serde=pickle_serde,
+        # Discovered via the `test_optimal_compression_length` test.
+        min_compress_len=400,
+    ):
+        self._serde = serde
+        self._compress = compress
+        self._decompress = decompress
+        self._min_compress_len = min_compress_len
+
+    def serialize(self, key, value):
+        value, flags = self._serde.serialize(key, value)
+
+        if len(value) > self._min_compress_len > 0:
+            old_value = value
+            value = self._compress(value)
+            # Don't use the compressed value if our end result is actually
+            # larger uncompressed.
+            if len(old_value) < len(value):
+                value = old_value
+            else:
+                flags |= FLAG_COMPRESSED
+
+        return value, flags
+
+    def deserialize(self, key, value, flags):
+        if flags & FLAG_COMPRESSED:
+            value = self._decompress(value)
+
+        value = self._serde.deserialize(key, value, flags)
+        return value
+
+
+compressed_serde = CompressedSerde()
+
+
+class LegacyWrappingSerde:
     """
     This class defines how to wrap legacy de/serialization functions into a
     'serde' object which implements '.serialize' and '.deserialize' methods.
@@ -144,7 +181,8 @@ class LegacyWrappingSerde(object):
     The serializer_func and deserializer_func are expected to be None in the
     case that they are missing.
     """
-    def __init__(self, serializer_func, deserializer_func):
+
+    def __init__(self, serializer_func, deserializer_func) -> None:
         self.serialize = serializer_func or self._default_serialize
         self.deserialize = deserializer_func or self._default_deserialize
 
@@ -153,6 +191,3 @@ class LegacyWrappingSerde(object):
 
     def _default_deserialize(self, key, value, flags):
         return value
-
-
-pickle_serde = PickleSerde()

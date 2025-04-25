@@ -11,99 +11,102 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import errno
 import platform
 import socket
-import six
+from functools import partial
+from ssl import SSLContext
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from pymemcache import pool
-
-from pymemcache.serde import LegacyWrappingSerde
 from pymemcache.exceptions import (
     MemcacheClientError,
-    MemcacheUnknownCommandError,
     MemcacheIllegalInputError,
     MemcacheServerError,
+    MemcacheUnexpectedCloseError,
+    MemcacheUnknownCommandError,
     MemcacheUnknownError,
-    MemcacheUnexpectedCloseError
 )
-
+from pymemcache.serde import LegacyWrappingSerde
 
 RECV_SIZE = 4096
 VALID_STORE_RESULTS = {
-    b'set':     (b'STORED', b'NOT_STORED'),
-    b'add':     (b'STORED', b'NOT_STORED'),
-    b'replace': (b'STORED', b'NOT_STORED'),
-    b'append':  (b'STORED', b'NOT_STORED'),
-    b'prepend': (b'STORED', b'NOT_STORED'),
-    b'cas':     (b'STORED', b'EXISTS', b'NOT_FOUND'),
+    b"set": (b"STORED", b"NOT_STORED"),
+    b"add": (b"STORED", b"NOT_STORED"),
+    b"replace": (b"STORED", b"NOT_STORED"),
+    b"append": (b"STORED", b"NOT_STORED"),
+    b"prepend": (b"STORED", b"NOT_STORED"),
+    b"cas": (b"STORED", b"EXISTS", b"NOT_FOUND"),
 }
 
 SOCKET_KEEPALIVE_SUPPORTED_SYSTEM = {
-    'Linux',
+    "Linux",
 }
 
 STORE_RESULTS_VALUE = {
-    b'STORED': True,
-    b'NOT_STORED': False,
-    b'NOT_FOUND':  None,
-    b'EXISTS': False
+    b"STORED": True,
+    b"NOT_STORED": False,
+    b"NOT_FOUND": None,
+    b"EXISTS": False,
 }
+
+ServerSpec = Union[Tuple[str, int], str]
+Key = Union[bytes, str]
 
 
 # Some of the values returned by the "stats" command
 # need mapping into native Python types
-def _parse_bool_int(value):
+def _parse_bool_int(value: bytes) -> bool:
     return int(value) != 0
 
 
-def _parse_bool_string_is_yes(value):
-    return value == b'yes'
+def _parse_bool_string_is_yes(value: bytes) -> bool:
+    return value == b"yes"
 
 
-def _parse_float(value):
-    return float(value.replace(b':', b'.'))
+def _parse_float(value: bytes) -> float:
+    return float(value.replace(b":", b"."))
 
 
-def _parse_hex(value):
+def _parse_hex(value: bytes) -> int:
     return int(value, 8)
 
 
-STAT_TYPES = {
+STAT_TYPES: Dict[bytes, Callable[[bytes], Any]] = {
     # General stats
-    b'version': six.binary_type,
-    b'rusage_user': _parse_float,
-    b'rusage_system': _parse_float,
-    b'hash_is_expanding': _parse_bool_int,
-    b'slab_reassign_running': _parse_bool_int,
-
+    b"version": bytes,
+    b"rusage_user": _parse_float,
+    b"rusage_system": _parse_float,
+    b"hash_is_expanding": _parse_bool_int,
+    b"slab_reassign_running": _parse_bool_int,
     # Settings stats
-    b'inter': six.binary_type,
-    b'growth_factor': float,
-    b'stat_key_prefix': six.binary_type,
-    b'umask': _parse_hex,
-    b'detail_enabled': _parse_bool_int,
-    b'cas_enabled': _parse_bool_int,
-    b'auth_enabled_sasl': _parse_bool_string_is_yes,
-    b'maxconns_fast': _parse_bool_int,
-    b'slab_reassign': _parse_bool_int,
-    b'slab_automove': _parse_bool_int,
+    b"inter": bytes,
+    b"growth_factor": float,
+    b"stat_key_prefix": bytes,
+    b"umask": _parse_hex,
+    b"detail_enabled": _parse_bool_int,
+    b"cas_enabled": _parse_bool_int,
+    b"auth_enabled_sasl": _parse_bool_string_is_yes,
+    b"maxconns_fast": _parse_bool_int,
+    b"slab_reassign": _parse_bool_int,
+    b"slab_automove": _parse_bool_int,
 }
 
 # Common helper functions.
 
 
-def check_key_helper(key, allow_unicode_keys, key_prefix=b''):
+def check_key_helper(
+    key: Key, allow_unicode_keys: bool, key_prefix: bytes = b""
+) -> bytes:
     """Checks key and add key_prefix."""
     if allow_unicode_keys:
-        if isinstance(key, six.text_type):
-            key = key.encode('utf8')
-    elif isinstance(key, six.string_types):
+        if isinstance(key, str):
+            key = key.encode("utf8")
+    elif isinstance(key, str):
         try:
-            if isinstance(key, six.binary_type):
-                key = key.decode().encode('ascii')
-            else:
-                key = key.encode('ascii')
+            key = key.encode("ascii")
         except (UnicodeEncodeError, UnicodeDecodeError):
             raise MemcacheIllegalInputError("Non-ASCII key: %r" % key)
 
@@ -115,34 +118,32 @@ def check_key_helper(key, allow_unicode_keys, key_prefix=b''):
     # second statement catches leading or trailing whitespace
     elif len(parts) > 1 or (parts and parts[0] != key):
         raise MemcacheIllegalInputError("Key contains whitespace: %r" % key)
-    elif b'\00' in key:
+    elif b"\00" in key:
         raise MemcacheIllegalInputError("Key contains null: %r" % key)
 
     return key
 
 
-def normalize_server_spec(server):
-    if isinstance(server, tuple) or server is None:
+def normalize_server_spec(server: ServerSpec) -> ServerSpec:
+    if isinstance(server, tuple):
         return server
-    if isinstance(server, list):
-        return tuple(server)  # Assume [host, port] provided.
-    if not isinstance(server, six.string_types):
-        raise ValueError('Unknown server provided: %r' % server)
-    if server.startswith('unix:'):
+    if not isinstance(server, str):
+        raise ValueError(f"Unsupported server specification: {server!r}")
+    if server.startswith("unix:"):
         return server[5:]
-    if server.startswith('/'):
+    if server.startswith("/"):
         return server
-    if ':' not in server or server.endswith(']'):
+    if ":" not in server or server.endswith("]"):
         host, port = server, 11211
     else:
-        host, port = server.rsplit(':', 1)
-        port = int(port)
-    if host.startswith('['):
-        host = host.strip('[]')
+        parts = server.rsplit(":", 1)
+        host, port = parts[0], int(parts[1])
+    if host.startswith("["):
+        host = host.strip("[]")
     return (host, port)
 
 
-class KeepaliveOpts(object):
+class KeepaliveOpts:
     """
     A configuration structure to define the socket keepalive.
 
@@ -159,24 +160,22 @@ class KeepaliveOpts(object):
         dropping the connection. Should be a positive integer most greater
         than zero.
     """
-    __slots__ = ('idle', 'intvl', 'cnt')
 
-    def __init__(self, idle=1, intvl=1, cnt=5):
+    __slots__ = ("idle", "intvl", "cnt")
+
+    def __init__(self, idle: int = 1, intvl: int = 1, cnt: int = 5) -> None:
         if idle < 1:
-            raise ValueError(
-                "The idle parameter must be greater or equal to 1.")
+            raise ValueError("The idle parameter must be greater or equal to 1.")
         self.idle = idle
         if intvl < 1:
-            raise ValueError(
-                "The intvl parameter must be greater or equal to 1.")
+            raise ValueError("The intvl parameter must be greater or equal to 1.")
         self.intvl = intvl
         if cnt < 1:
-            raise ValueError(
-                "The cnt parameter must be greater or equal to 1.")
+            raise ValueError("The cnt parameter must be greater or equal to 1.")
         self.cnt = cnt
 
 
-class Client(object):
+class Client:
     """
     A client for a single memcached server.
 
@@ -272,22 +271,24 @@ class Client(object):
      to memcached.
     """
 
-    def __init__(self,
-                 server,
-                 serde=None,
-                 serializer=None,
-                 deserializer=None,
-                 connect_timeout=None,
-                 timeout=None,
-                 no_delay=False,
-                 ignore_exc=False,
-                 socket_module=socket,
-                 socket_keepalive=None,
-                 key_prefix=b'',
-                 default_noreply=True,
-                 allow_unicode_keys=False,
-                 encoding='ascii',
-                 tls_context=None):
+    def __init__(
+        self,
+        server: ServerSpec,
+        serde=None,
+        serializer=None,
+        deserializer=None,
+        connect_timeout: Optional[float] = None,
+        timeout: Optional[float] = None,
+        no_delay: bool = False,
+        ignore_exc: bool = False,
+        socket_module: ModuleType = socket,
+        socket_keepalive: Optional[KeepaliveOpts] = None,
+        key_prefix: bytes = b"",
+        default_noreply: bool = True,
+        allow_unicode_keys: bool = False,
+        encoding: str = "ascii",
+        tls_context: Optional[SSLContext] = None,
+    ):
         """
         Constructor.
 
@@ -336,7 +337,7 @@ class Client(object):
         if self.socket_keepalive is not None:
             if user_system not in SOCKET_KEEPALIVE_SUPPORTED_SYSTEM:
                 raise SystemError(
-                    "Pymemcache's socket keepalive mechaniss doesn't "
+                    "Pymemcache's socket keepalive mechanism doesn't "
                     "support your system ({user_system}). If "
                     "you see this message it mean that you tried to "
                     "configure your socket keepalive on an unsupported "
@@ -344,8 +345,7 @@ class Client(object):
                     "keepalive=False` or use a supported system. "
                     "Supported systems are: {systems}".format(
                         user_system=user_system,
-                        systems=", ".join(sorted(
-                            SOCKET_KEEPALIVE_SUPPORTED_SYSTEM))
+                        systems=", ".join(sorted(SOCKET_KEEPALIVE_SUPPORTED_SYSTEM)),
                     )
                 )
             if not isinstance(self.socket_keepalive, KeepaliveOpts):
@@ -357,10 +357,10 @@ class Client(object):
                     "KeepaliveOpts object. That's the only supported type "
                     "of structure."
                 )
-        self.sock = None
-        if isinstance(key_prefix, six.text_type):
-            key_prefix = key_prefix.encode('ascii')
-        if not isinstance(key_prefix, six.binary_type):
+        self.sock: Optional[socket.socket] = None
+        if isinstance(key_prefix, str):
+            key_prefix = key_prefix.encode("ascii")
+        if not isinstance(key_prefix, bytes):
             raise TypeError("key_prefix should be bytes.")
         self.key_prefix = key_prefix
         self.default_noreply = default_noreply
@@ -368,12 +368,13 @@ class Client(object):
         self.encoding = encoding
         self.tls_context = tls_context
 
-    def check_key(self, key):
+    def check_key(self, key: Key, key_prefix: bytes) -> bytes:
         """Checks key and add key_prefix."""
-        return check_key_helper(key, allow_unicode_keys=self.allow_unicode_keys,
-                                key_prefix=self.key_prefix)
+        return check_key_helper(
+            key, allow_unicode_keys=self.allow_unicode_keys, key_prefix=key_prefix
+        )
 
-    def _connect(self):
+    def _connect(self) -> None:
         self.close()
 
         s = self.socket_module
@@ -381,13 +382,11 @@ class Client(object):
         if not isinstance(self.server, tuple):
             sockaddr = self.server
             sock = s.socket(s.AF_UNIX, s.SOCK_STREAM)
-
         else:
             sock = None
             error = None
             host, port = self.server
-            info = s.getaddrinfo(host, port, s.AF_UNSPEC, s.SOCK_STREAM,
-                                 s.IPPROTO_TCP)
+            info = s.getaddrinfo(host, port, s.AF_UNSPEC, s.SOCK_STREAM, s.IPPROTO_TCP)
             for family, socktype, proto, _, sockaddr in info:
                 try:
                     sock = s.socket(family, socktype, proto)
@@ -411,12 +410,17 @@ class Client(object):
             sock.settimeout(self.connect_timeout)
             if self.socket_keepalive is not None:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,
-                                self.socket_keepalive.idle)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
-                                self.socket_keepalive.intvl)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,
-                                self.socket_keepalive.cnt)
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, self.socket_keepalive.idle
+                )
+                sock.setsockopt(
+                    socket.IPPROTO_TCP,
+                    socket.TCP_KEEPINTVL,
+                    self.socket_keepalive.intvl,
+                )
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, self.socket_keepalive.cnt
+                )
             sock.connect(sockaddr)
             sock.settimeout(self.timeout)
         except Exception:
@@ -425,7 +429,7 @@ class Client(object):
 
         self.sock = sock
 
-    def close(self):
+    def close(self) -> None:
         """Close the connection to memcached, if it is open. The next call to a
         method that requires a connection will re-open it."""
         if self.sock is not None:
@@ -438,7 +442,14 @@ class Client(object):
 
     disconnect_all = close
 
-    def set(self, key, value, expire=0, noreply=None, flags=None):
+    def set(
+        self,
+        key: Key,
+        value: Any,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ) -> Optional[bool]:
         """
         The memcached "set" command.
 
@@ -459,10 +470,17 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        return self._store_cmd(b'set', {key: value}, expire, noreply,
-                               flags=flags)[key]
+        # Optional because _store_cmd lookup in STORE_RESULTS_VALUE can return None in some cases.
+        # TODO: refactor to fix
+        return self._store_cmd(b"set", {key: value}, expire, noreply, flags=flags)[key]
 
-    def set_many(self, values, expire=0, noreply=None, flags=None):
+    def set_many(
+        self,
+        values: Dict[Key, Any],
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ) -> List[Key]:
         """
         A convenience function for setting multiple values.
 
@@ -482,12 +500,19 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        result = self._store_cmd(b'set', values, expire, noreply, flags=flags)
-        return [k for k, v in six.iteritems(result) if not v]
+        result = self._store_cmd(b"set", values, expire, noreply, flags=flags)
+        return [k for k, v in result.items() if not v]
 
     set_multi = set_many
 
-    def add(self, key, value, expire=0, noreply=None, flags=None):
+    def add(
+        self,
+        key: Key,
+        value: Any,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ) -> bool:
         """
         The memcached "add" command.
 
@@ -509,10 +534,21 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        return self._store_cmd(b'add', {key: value}, expire, noreply,
-                               flags=flags)[key]
+        response = self._store_cmd(b"add", {key: value}, expire, noreply, flags=flags)[
+            key
+        ]
+        # For typing, can only be None, if cas command
+        assert response is not None
+        return response
 
-    def replace(self, key, value, expire=0, noreply=None, flags=None):
+    def replace(
+        self,
+        key: Key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ) -> bool:
         """
         The memcached "replace" command.
 
@@ -534,10 +570,21 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        return self._store_cmd(b'replace', {key: value}, expire, noreply,
-                               flags=flags)[key]
+        response = self._store_cmd(
+            b"replace", {key: value}, expire, noreply, flags=flags
+        )[key]
+        # for typing
+        assert response is not None
+        return response
 
-    def append(self, key, value, expire=0, noreply=None, flags=None):
+    def append(
+        self,
+        key: Key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ) -> bool:
         """
         The memcached "append" command.
 
@@ -556,10 +603,21 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        return self._store_cmd(b'append', {key: value}, expire, noreply,
-                               flags=flags)[key]
+        response = self._store_cmd(
+            b"append", {key: value}, expire, noreply, flags=flags
+        )[key]
+        # For typing
+        assert response is not None
+        return response
 
-    def prepend(self, key, value, expire=0, noreply=None, flags=None):
+    def prepend(
+        self,
+        key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         """
         The memcached "prepend" command.
 
@@ -578,10 +636,19 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        return self._store_cmd(b'prepend', {key: value}, expire, noreply,
-                               flags=flags)[key]
+        return self._store_cmd(b"prepend", {key: value}, expire, noreply, flags=flags)[
+            key
+        ]
 
-    def cas(self, key, value, cas, expire=0, noreply=False, flags=None):
+    def cas(
+        self,
+        key,
+        value,
+        cas,
+        expire: int = 0,
+        noreply=False,
+        flags: Optional[int] = None,
+    ) -> Optional[bool]:
         """
         The memcached "cas" command.
 
@@ -602,10 +669,11 @@ class Client(object):
           value and True if it existed and was changed.
         """
         cas = self._check_cas(cas)
-        return self._store_cmd(b'cas', {key: value}, expire, noreply,
-                               flags=flags, cas=cas)[key]
+        return self._store_cmd(
+            b"cas", {key: value}, expire, noreply, flags=flags, cas=cas
+        )[key]
 
-    def get(self, key, default=None):
+    def get(self, key: Key, default: Optional[Any] = None) -> Any:
         """
         The memcached "get" command, but only for one key, as a convenience.
 
@@ -616,9 +684,11 @@ class Client(object):
         Returns:
           The value for the key, or default if the key wasn't found.
         """
-        return self._fetch_cmd(b'get', [key], False).get(key, default)
+        return self._fetch_cmd(b"get", [key], False, key_prefix=self.key_prefix).get(
+            key, default
+        )
 
-    def get_many(self, keys):
+    def get_many(self, keys: Iterable[Key]) -> Dict[Key, Any]:
         """
         The memcached "get" command.
 
@@ -633,11 +703,13 @@ class Client(object):
         if not keys:
             return {}
 
-        return self._fetch_cmd(b'get', keys, False)
+        return self._fetch_cmd(b"get", keys, False, key_prefix=self.key_prefix)
 
     get_multi = get_many
 
-    def gets(self, key, default=None, cas_default=None):
+    def gets(
+        self, key: Key, default: Any = None, cas_default: Any = None
+    ) -> Tuple[Any, Any]:
         """
         The memcached "gets" command for one key, as a convenience.
 
@@ -651,9 +723,11 @@ class Client(object):
           or (default, cas_defaults) if the key was not found.
         """
         defaults = (default, cas_default)
-        return self._fetch_cmd(b'gets', [key], True).get(key, defaults)
+        return self._fetch_cmd(b"gets", [key], True, key_prefix=self.key_prefix).get(
+            key, defaults
+        )
 
-    def gets_many(self, keys):
+    def gets_many(self, keys: Iterable[Key]) -> Dict[Key, Tuple[Any, Any]]:
         """
         The memcached "gets" command.
 
@@ -668,9 +742,9 @@ class Client(object):
         if not keys:
             return {}
 
-        return self._fetch_cmd(b'gets', keys, True)
+        return self._fetch_cmd(b"gets", keys, True, key_prefix=self.key_prefix)
 
-    def delete(self, key, noreply=None):
+    def delete(self, key: Key, noreply: Optional[bool] = None) -> bool:
         """
         The memcached "delete" command.
 
@@ -686,16 +760,16 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        cmd = b'delete ' + self.check_key(key)
+        cmd = b"delete " + self.check_key(key, self.key_prefix)
         if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        results = self._misc_cmd([cmd], b'delete', noreply)
+            cmd += b" noreply"
+        cmd += b"\r\n"
+        results = self._misc_cmd([cmd], b"delete", noreply)
         if noreply:
             return True
-        return results[0] == b'DELETED'
+        return results[0] == b"DELETED"
 
-    def delete_many(self, keys, noreply=None):
+    def delete_many(self, keys: Iterable[Key], noreply: Optional[bool] = None) -> bool:
         """
         A convenience function to delete multiple keys.
 
@@ -719,15 +793,19 @@ class Client(object):
         cmds = []
         for key in keys:
             cmds.append(
-                b'delete ' + self.check_key(key) +
-                (b' noreply' if noreply else b'') +
-                b'\r\n')
-        self._misc_cmd(cmds, b'delete', noreply)
+                b"delete "
+                + self.check_key(key, self.key_prefix)
+                + (b" noreply" if noreply else b"")
+                + b"\r\n"
+            )
+        self._misc_cmd(cmds, b"delete", noreply)
         return True
 
     delete_multi = delete_many
 
-    def incr(self, key, value, noreply=False):
+    def incr(
+        self, key: Key, value: int, noreply: Optional[bool] = False
+    ) -> Optional[int]:
         """
         The memcached "incr" command.
 
@@ -740,20 +818,22 @@ class Client(object):
           If noreply is True, always returns None. Otherwise returns the new
           value of the key, or None if the key wasn't found.
         """
-        key = self.check_key(key)
-        value = self._check_integer(value, "value")
-        cmd = b'incr ' + key + b' ' + value
+        key = self.check_key(key, self.key_prefix)
+        val = self._check_integer(value, "value")
+        cmd = b"incr " + key + b" " + val
         if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        results = self._misc_cmd([cmd], b'incr', noreply)
+            cmd += b" noreply"
+        cmd += b"\r\n"
+        results = self._misc_cmd([cmd], b"incr", noreply)
         if noreply:
             return None
-        if results[0] == b'NOT_FOUND':
+        if results[0] == b"NOT_FOUND":
             return None
         return int(results[0])
 
-    def decr(self, key, value, noreply=False):
+    def decr(
+        self, key: Key, value: int, noreply: Optional[bool] = False
+    ) -> Optional[int]:
         """
         The memcached "decr" command.
 
@@ -766,20 +846,20 @@ class Client(object):
           If noreply is True, always returns None. Otherwise returns the new
           value of the key, or None if the key wasn't found.
         """
-        key = self.check_key(key)
-        value = self._check_integer(value, "value")
-        cmd = b'decr ' + key + b' ' + value
+        key = self.check_key(key, self.key_prefix)
+        val = self._check_integer(value, "value")
+        cmd = b"decr " + key + b" " + val
         if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        results = self._misc_cmd([cmd], b'decr', noreply)
+            cmd += b" noreply"
+        cmd += b"\r\n"
+        results = self._misc_cmd([cmd], b"decr", noreply)
         if noreply:
             return None
-        if results[0] == b'NOT_FOUND':
+        if results[0] == b"NOT_FOUND":
             return None
         return int(results[0])
 
-    def touch(self, key, expire=0, noreply=None):
+    def touch(self, key: Key, expire: int = 0, noreply: Optional[bool] = None) -> bool:
         """
         The memcached "touch" command.
 
@@ -796,16 +876,16 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        key = self.check_key(key)
-        expire = self._check_integer(expire, "expire")
-        cmd = b'touch ' + key + b' ' + expire
+        key = self.check_key(key, self.key_prefix)
+        expire_bytes = self._check_integer(expire, "expire")
+        cmd = b"touch " + key + b" " + expire_bytes
         if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        results = self._misc_cmd([cmd], b'touch', noreply)
+            cmd += b" noreply"
+        cmd += b"\r\n"
+        results = self._misc_cmd([cmd], b"touch", noreply)
         if noreply:
             return True
-        return results[0] == b'TOUCHED'
+        return results[0] == b"TOUCHED"
 
     def stats(self, *args):
         """
@@ -822,9 +902,9 @@ class Client(object):
         Returns:
           A dict of the returned stats.
         """
-        result = self._fetch_cmd(b'stats', args, False)
+        result = self._fetch_cmd(b"stats", args, False)
 
-        for key, value in six.iteritems(result):
+        for key, value in result.items():
             converter = STAT_TYPES.get(key, int)
             try:
                 result[key] = converter(value)
@@ -833,7 +913,7 @@ class Client(object):
 
         return result
 
-    def cache_memlimit(self, memlimit):
+    def cache_memlimit(self, memlimit) -> bool:
         """
         The memcached "cache_memlimit" command.
 
@@ -845,10 +925,10 @@ class Client(object):
           If no exception is raised, always returns True.
         """
         memlimit = self._check_integer(memlimit, "memlimit")
-        self._fetch_cmd(b'cache_memlimit', [memlimit], False)
+        self._fetch_cmd(b"cache_memlimit", [memlimit], False)
         return True
 
-    def version(self):
+    def version(self) -> bytes:
         """
         The memcached "version" command.
 
@@ -856,15 +936,37 @@ class Client(object):
             A string of the memcached version.
         """
         cmd = b"version\r\n"
-        results = self._misc_cmd([cmd], b'version', False)
-        before, _, after = results[0].partition(b' ')
+        results = self._misc_cmd([cmd], b"version", False)
+        before, _, after = results[0].partition(b" ")
 
-        if before != b'VERSION':
-            raise MemcacheUnknownError(
-                "Received unexpected response: %s" % results[0])
+        if before != b"VERSION":
+            raise MemcacheUnknownError(f"Received unexpected response: {results[0]!r}")
         return after
 
-    def flush_all(self, delay=0, noreply=None):
+    def raw_command(
+        self, command: Union[str, bytes], end_tokens: Union[str, bytes] = "\r\n"
+    ) -> bytes:
+        """
+        Sends an arbitrary command to the server and parses the response until a
+        specified token is encountered.
+
+        Args:
+            command: str|bytes: The command to send.
+            end_tokens: str|bytes: The token expected at the end of the
+                response. If the `end_token` is not found, the client will wait
+                until the timeout specified in the constructor.
+
+        Returns:
+            The response from the server, with the `end_token` removed.
+        """
+        encoding = "utf8" if self.allow_unicode_keys else "ascii"
+        command = command.encode(encoding) if isinstance(command, str) else command
+        end_tokens = (
+            end_tokens.encode(encoding) if isinstance(end_tokens, str) else end_tokens
+        )
+        return self._misc_cmd([b"" + command + b"\r\n"], command, False, end_tokens)[0]
+
+    def flush_all(self, delay: int = 0, noreply: Optional[bool] = None) -> bool:
         """
         The memcached "flush_all" command.
 
@@ -879,17 +981,17 @@ class Client(object):
         """
         if noreply is None:
             noreply = self.default_noreply
-        delay = self._check_integer(delay, "delay")
-        cmd = b'flush_all ' + delay
+        delay_bytes = self._check_integer(delay, "delay")
+        cmd = b"flush_all " + delay_bytes
         if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        results = self._misc_cmd([cmd], b'flush_all', noreply)
+            cmd += b" noreply"
+        cmd += b"\r\n"
+        results = self._misc_cmd([cmd], b"flush_all", noreply)
         if noreply:
             return True
-        return results[0] == b'OK'
+        return results[0] == b"OK"
 
-    def quit(self):
+    def quit(self) -> None:
         """
         The memcached "quit" command.
 
@@ -898,10 +1000,10 @@ class Client(object):
         be re-used after quit.
         """
         cmd = b"quit\r\n"
-        self._misc_cmd([cmd], b'quit', True)
+        self._misc_cmd([cmd], b"quit", True)
         self.close()
 
-    def shutdown(self, graceful=False):
+    def shutdown(self, graceful: bool = False) -> None:
         """
         The memcached "shutdown" command.
 
@@ -914,68 +1016,72 @@ class Client(object):
           graceful: optional bool, True to request a graceful shutdown with
                     SIGUSR1 (defaults to False, i.e. SIGINT shutdown).
         """
-        cmd = b'shutdown'
+        cmd = b"shutdown"
         if graceful:
-            cmd += b' graceful'
-        cmd += b'\r\n'
+            cmd += b" graceful"
+        cmd += b"\r\n"
 
         # The shutdown command raises a server-side error if the shutdown
         # protocol command is not enabled. Otherwise, a successful shutdown
         # is expected to close the remote end of the transport.
         try:
-            self._misc_cmd([cmd], b'shutdown', False)
+            self._misc_cmd([cmd], b"shutdown", False)
         except MemcacheUnexpectedCloseError:
             pass
 
-    def _raise_errors(self, line, name):
-        if line.startswith(b'ERROR'):
+    def _raise_errors(self, line: bytes, name: bytes) -> None:
+        if line.startswith(b"ERROR"):
             raise MemcacheUnknownCommandError(name)
 
-        if line.startswith(b'CLIENT_ERROR'):
-            error = line[line.find(b' ') + 1:]
+        if line.startswith(b"CLIENT_ERROR"):
+            error = line[line.find(b" ") + 1 :]
             raise MemcacheClientError(error)
 
-        if line.startswith(b'SERVER_ERROR'):
-            error = line[line.find(b' ') + 1:]
+        if line.startswith(b"SERVER_ERROR"):
+            error = line[line.find(b" ") + 1 :]
             raise MemcacheServerError(error)
 
-    def _check_integer(self, value, name):
+    def _check_integer(self, value: int, name: str) -> bytes:
         """Check that a value is an integer and encode it as a binary string"""
-        if not isinstance(value, six.integer_types):
+        if not isinstance(value, int):
             raise MemcacheIllegalInputError(
-                '%s must be integer, got bad value: %r' % (name, value)
+                f"{name} must be integer, got bad value: {value!r}"
             )
 
-        return six.text_type(value).encode(self.encoding)
+        return str(value).encode(self.encoding)
 
-    def _check_cas(self, cas):
+    def _check_cas(self, cas: Union[int, str, bytes]) -> bytes:
         """Check that a value is a valid input for 'cas' -- either an int or a
         string containing only 0-9
 
         The value will be (re)encoded so that we can accept strings or bytes.
         """
         # convert non-binary values to binary
-        if isinstance(cas, (six.integer_types, six.string_types)):
+        if isinstance(cas, (int, str)):
             try:
-                cas = six.text_type(cas).encode(self.encoding)
+                cas = str(cas).encode(self.encoding)
             except UnicodeEncodeError:
-                raise MemcacheIllegalInputError(
-                    'non-ASCII cas value: %r' % cas)
-        elif not isinstance(cas, six.binary_type):
+                raise MemcacheIllegalInputError("non-ASCII cas value: %r" % cas)
+        elif not isinstance(cas, bytes):
             raise MemcacheIllegalInputError(
-                'cas must be integer, string, or bytes, got bad value: %r' % cas
+                "cas must be integer, string, or bytes, got bad value: %r" % cas
             )
 
         if not cas.isdigit():
             raise MemcacheIllegalInputError(
-                'cas must only contain values in 0-9, got bad value: %r'
-                % cas
+                "cas must only contain values in 0-9, got bad value: %r" % cas
             )
 
         return cas
 
-    def _extract_value(self, expect_cas, line, buf, remapped_keys,
-                       prefixed_keys):
+    def _extract_value(
+        self,
+        expect_cas: bool,
+        line: bytes,
+        buf: bytes,
+        remapped_keys: Dict[bytes, Key],
+        prefixed_keys: List[bytes],
+    ) -> Tuple[Key, Union[Any, Tuple[Any, bytes]], bytes]:
         """
         This function is abstracted from _fetch_cmd to support different ways
         of value extraction. In order to use this feature, _extract_value needs
@@ -987,41 +1093,53 @@ class Client(object):
             try:
                 _, key, flags, size = line.split()
             except Exception as e:
-                raise ValueError("Unable to parse line %s: %s" % (line, e))
+                raise ValueError(f"Unable to parse line {line!r}: {e}")
 
         value = None
         try:
+            # For typing
+            assert self.sock is not None
+
             buf, value = _readvalue(self.sock, buf, int(size))
         except MemcacheUnexpectedCloseError:
             self.close()
             raise
-        key = remapped_keys[key]
-        value = self.serde.deserialize(key, value, int(flags))
+        original_key = remapped_keys[key]
+        value = self.serde.deserialize(original_key, value, int(flags))
 
         if expect_cas:
-            return key, (value, cas), buf
+            return original_key, (value, cas), buf
         else:
-            return key, value, buf
+            return original_key, value, buf
 
-    def _fetch_cmd(self, name, keys, expect_cas):
-        prefixed_keys = [self.check_key(k) for k in keys]
+    def _fetch_cmd(
+        self,
+        name: bytes,
+        keys: Iterable[Key],
+        expect_cas: bool,
+        key_prefix: bytes = b"",
+    ) -> Dict[Key, Any]:
+        prefixed_keys = [self.check_key(k, key_prefix=key_prefix) for k in keys]
         remapped_keys = dict(zip(prefixed_keys, keys))
 
         # It is important for all keys to be listed in their original order.
         cmd = name
         if prefixed_keys:
-            cmd += b' ' + b' '.join(prefixed_keys)
-        cmd += b'\r\n'
+            cmd += b" " + b" ".join(prefixed_keys)
+        cmd += b"\r\n"
 
         try:
             if self.sock is None:
                 self._connect()
 
+                # For typing
+                assert self.sock is not None
+
             self.sock.sendall(cmd)
 
-            buf = b''
+            buf = b""
             line = None
-            result = {}
+            result: Dict[Key, Any] = {}
             while True:
                 try:
                     buf, line = _readline(self.sock, buf)
@@ -1029,20 +1147,20 @@ class Client(object):
                     self.close()
                     raise
                 self._raise_errors(line, name)
-                if line == b'END' or line == b'OK':
+                if line == b"END" or line == b"OK":
                     return result
-                elif line.startswith(b'VALUE'):
-                    key, value, buf = self._extract_value(expect_cas, line, buf,
-                                                          remapped_keys,
-                                                          prefixed_keys)
+                elif line.startswith(b"VALUE"):
+                    key, value, buf = self._extract_value(
+                        expect_cas, line, buf, remapped_keys, prefixed_keys
+                    )
                     result[key] = value
-                elif name == b'stats' and line.startswith(b'STAT'):
+                elif name == b"stats" and line.startswith(b"STAT"):
                     key_value = line.split()
                     result[key_value[1]] = key_value[2] if len(key_value) > 2 else b""
-                elif name == b'stats' and line.startswith(b'ITEM'):
+                elif name == b"stats" and line.startswith(b"ITEM"):
                     # For 'stats cachedump' commands
                     key_value = line.split()
-                    result[key_value[1]] = b' '.join(key_value[2:])
+                    result[key_value[1]] = b" ".join(key_value[2:])
                 else:
                     raise MemcacheUnknownError(line[:32])
         except Exception:
@@ -1051,22 +1169,30 @@ class Client(object):
                 return {}
             raise
 
-    def _store_cmd(self, name, values, expire, noreply, flags=None, cas=None):
+    def _store_cmd(
+        self,
+        name: bytes,
+        values: Dict[Key, Any],
+        expire: int,
+        noreply: bool,
+        flags: Optional[int] = None,
+        cas: Optional[bytes] = None,
+    ) -> Dict[Key, Optional[bool]]:
         cmds = []
         keys = []
 
-        extra = b''
+        extra = b""
         if cas is not None:
-            extra += b' ' + cas
+            extra += b" " + cas
         if noreply:
-            extra += b' noreply'
-        expire = self._check_integer(expire, "expire")
+            extra += b" noreply"
+        expire_bytes = self._check_integer(expire, "expire")
 
-        for key, data in six.iteritems(values):
+        for key, data in values.items():
             # must be able to reliably map responses back to the original order
             keys.append(key)
 
-            key = self.check_key(key)
+            key = self.check_key(key, self.key_prefix)
             data, data_flags = self.serde.serialize(key, data)
 
             # If 'flags' was explicitly provided, it overrides the value
@@ -1074,29 +1200,43 @@ class Client(object):
             if flags is not None:
                 data_flags = flags
 
-            if not isinstance(data, six.binary_type):
+            if not isinstance(data, bytes):
                 try:
-                    data = six.text_type(data).encode(self.encoding)
+                    data = str(data).encode(self.encoding)
                 except UnicodeEncodeError as e:
                     raise MemcacheIllegalInputError(
-                            "Data values must be binary-safe: %s" % e)
+                        "Data values must be binary-safe: %s" % e
+                    )
 
-            cmds.append(name + b' ' + key + b' ' +
-                        six.text_type(data_flags).encode(self.encoding) +
-                        b' ' + expire +
-                        b' ' + six.text_type(len(data)).encode(self.encoding) +
-                        extra + b'\r\n' + data + b'\r\n')
+            cmds.append(
+                name
+                + b" "
+                + key
+                + b" "
+                + str(data_flags).encode(self.encoding)
+                + b" "
+                + expire_bytes
+                + b" "
+                + str(len(data)).encode(self.encoding)
+                + extra
+                + b"\r\n"
+                + data
+                + b"\r\n"
+            )
 
         if self.sock is None:
             self._connect()
 
+            # For typing
+            assert self.sock is not None
+
         try:
-            self.sock.sendall(b''.join(cmds))
+            self.sock.sendall(b"".join(cmds))
             if noreply:
                 return {k: True for k in keys}
 
             results = {}
-            buf = b''
+            buf = b""
             line = None
             for key in keys:
                 try:
@@ -1115,22 +1255,40 @@ class Client(object):
             self.close()
             raise
 
-    def _misc_cmd(self, cmds, cmd_name, noreply):
+    def _misc_cmd(
+        self,
+        cmds: Iterable[bytes],
+        cmd_name: bytes,
+        noreply: Optional[bool],
+        end_tokens=None,
+    ) -> List[bytes]:
+
+        # If no end_tokens have been given, just assume standard memcached
+        # operations, which end in "\r\n", use regular code for that.
+        _reader: Callable[[socket.socket, bytes], Tuple[bytes, bytes]]
+        if end_tokens:
+            _reader = partial(_readsegment, end_tokens=end_tokens)
+        else:
+            _reader = _readline
+
         if self.sock is None:
             self._connect()
 
+            # For typing
+            assert self.sock is not None
+
         try:
-            self.sock.sendall(b''.join(cmds))
+            self.sock.sendall(b"".join(cmds))
 
             if noreply:
                 return []
 
             results = []
-            buf = b''
+            buf = b""
             line = None
             for cmd in cmds:
                 try:
-                    buf, line = _readline(self.sock, buf)
+                    buf, line = _reader(self.sock, buf)
                 except MemcacheUnexpectedCloseError:
                     self.close()
                     raise
@@ -1142,7 +1300,7 @@ class Client(object):
             self.close()
             raise
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: Key, value):
         self.set(key, value, noreply=True)
 
     def __getitem__(self, key):
@@ -1155,7 +1313,7 @@ class Client(object):
         self.delete(key, noreply=True)
 
 
-class PooledClient(object):
+class PooledClient:
     """A thread-safe pool of clients (with the same client api).
 
     Args:
@@ -1179,25 +1337,27 @@ class PooledClient(object):
     #: :class:`Client` class used to create new clients
     client_class = Client
 
-    def __init__(self,
-                 server,
-                 serde=None,
-                 serializer=None,
-                 deserializer=None,
-                 connect_timeout=None,
-                 timeout=None,
-                 no_delay=False,
-                 ignore_exc=False,
-                 socket_module=socket,
-                 socket_keepalive=None,
-                 key_prefix=b'',
-                 max_pool_size=None,
-                 pool_idle_timeout=0,
-                 lock_generator=None,
-                 default_noreply=True,
-                 allow_unicode_keys=False,
-                 encoding='ascii',
-                 tls_context=None):
+    def __init__(
+        self,
+        server: ServerSpec,
+        serde=None,
+        serializer=None,
+        deserializer=None,
+        connect_timeout=None,
+        timeout=None,
+        no_delay=False,
+        ignore_exc=False,
+        socket_module=socket,
+        socket_keepalive=None,
+        key_prefix=b"",
+        max_pool_size=None,
+        pool_idle_timeout=0,
+        lock_generator=None,
+        default_noreply: bool = True,
+        allow_unicode_keys=False,
+        encoding="ascii",
+        tls_context=None,
+    ):
         self.server = normalize_server_spec(server)
         self.serde = serde or LegacyWrappingSerde(serializer, deserializer)
         self.connect_timeout = connect_timeout
@@ -1208,9 +1368,9 @@ class PooledClient(object):
         self.socket_keepalive = socket_keepalive
         self.default_noreply = default_noreply
         self.allow_unicode_keys = allow_unicode_keys
-        if isinstance(key_prefix, six.text_type):
-            key_prefix = key_prefix.encode('ascii')
-        if not isinstance(key_prefix, six.binary_type):
+        if isinstance(key_prefix, str):
+            key_prefix = key_prefix.encode("ascii")
+        if not isinstance(key_prefix, bytes):
             raise TypeError("key_prefix should be bytes.")
         self.key_prefix = key_prefix
         self.client_pool = pool.ObjectPool(
@@ -1218,16 +1378,18 @@ class PooledClient(object):
             after_remove=lambda client: client.close(),
             max_size=max_pool_size,
             idle_timeout=pool_idle_timeout,
-            lock_generator=lock_generator)
+            lock_generator=lock_generator,
+        )
         self.encoding = encoding
         self.tls_context = tls_context
 
-    def check_key(self, key):
+    def check_key(self, key: Key) -> bytes:
         """Checks key and add key_prefix."""
-        return check_key_helper(key, allow_unicode_keys=self.allow_unicode_keys,
-                                key_prefix=self.key_prefix)
+        return check_key_helper(
+            key, allow_unicode_keys=self.allow_unicode_keys, key_prefix=self.key_prefix
+        )
 
-    def _create_client(self):
+    def _create_client(self) -> Client:
         return self.client_class(
             self.server,
             serde=self.serde,
@@ -1242,46 +1404,91 @@ class PooledClient(object):
             key_prefix=self.key_prefix,
             default_noreply=self.default_noreply,
             allow_unicode_keys=self.allow_unicode_keys,
-            tls_context=self.tls_context)
+            tls_context=self.tls_context,
+        )
 
-    def close(self):
+    def close(self) -> None:
         self.client_pool.clear()
 
     disconnect_all = close
 
-    def set(self, key, value, expire=0, noreply=None, flags=None):
+    def set(
+        self,
+        key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.set(key, value, expire=expire, noreply=noreply,
-                              flags=flags)
+            return client.set(key, value, expire=expire, noreply=noreply, flags=flags)
 
-    def set_many(self, values, expire=0, noreply=None, flags=None):
+    def set_many(
+        self,
+        values,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.set_many(values, expire=expire, noreply=noreply,
-                                   flags=flags)
+            return client.set_many(values, expire=expire, noreply=noreply, flags=flags)
 
     set_multi = set_many
 
-    def replace(self, key, value, expire=0, noreply=None, flags=None):
+    def replace(
+        self,
+        key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.replace(key, value, expire=expire, noreply=noreply,
-                                  flags=flags)
+            return client.replace(
+                key, value, expire=expire, noreply=noreply, flags=flags
+            )
 
-    def append(self, key, value, expire=0, noreply=None, flags=None):
+    def append(
+        self,
+        key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.append(key, value, expire=expire, noreply=noreply,
-                                 flags=flags)
+            return client.append(
+                key, value, expire=expire, noreply=noreply, flags=flags
+            )
 
-    def prepend(self, key, value, expire=0, noreply=None, flags=None):
+    def prepend(
+        self,
+        key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.prepend(key, value, expire=expire, noreply=noreply,
-                                  flags=flags)
+            return client.prepend(
+                key, value, expire=expire, noreply=noreply, flags=flags
+            )
 
-    def cas(self, key, value, cas, expire=0, noreply=False, flags=None):
+    def cas(
+        self,
+        key,
+        value,
+        cas,
+        expire: int = 0,
+        noreply=False,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.cas(key, value, cas,
-                              expire=expire, noreply=noreply, flags=flags)
+            return client.cas(
+                key, value, cas, expire=expire, noreply=noreply, flags=flags
+            )
 
-    def get(self, key, default=None):
+    def get(self, key: Key, default: Any = None) -> Any:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             try:
                 return client.get(key, default)
@@ -1291,7 +1498,7 @@ class PooledClient(object):
                 else:
                     raise
 
-    def get_many(self, keys):
+    def get_many(self, keys: Iterable[Key]) -> Dict[Key, Any]:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             try:
                 return client.get_many(keys)
@@ -1303,7 +1510,7 @@ class PooledClient(object):
 
     get_multi = get_many
 
-    def gets(self, key):
+    def gets(self, key: Key) -> Tuple[Any, Any]:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             try:
                 return client.gets(key)
@@ -1313,7 +1520,7 @@ class PooledClient(object):
                 else:
                     raise
 
-    def gets_many(self, keys):
+    def gets_many(self, keys: Iterable[Key]) -> Dict[Key, Tuple[Any, Any]]:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             try:
                 return client.gets_many(keys)
@@ -1323,30 +1530,36 @@ class PooledClient(object):
                 else:
                     raise
 
-    def delete(self, key, noreply=None):
+    def delete(self, key: Key, noreply: Optional[bool] = None) -> bool:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.delete(key, noreply=noreply)
 
-    def delete_many(self, keys, noreply=None):
+    def delete_many(self, keys: Iterable[Key], noreply: Optional[bool] = None) -> bool:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.delete_many(keys, noreply=noreply)
 
     delete_multi = delete_many
 
-    def add(self, key, value, expire=0, noreply=None, flags=None):
+    def add(
+        self,
+        key: Key,
+        value,
+        expire: int = 0,
+        noreply: Optional[bool] = None,
+        flags: Optional[int] = None,
+    ):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.add(key, value, expire=expire, noreply=noreply,
-                              flags=flags)
+            return client.add(key, value, expire=expire, noreply=noreply, flags=flags)
 
-    def incr(self, key, value, noreply=False):
+    def incr(self, key: Key, value, noreply=False):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.incr(key, value, noreply=noreply)
 
-    def decr(self, key, value, noreply=False):
+    def decr(self, key: Key, value, noreply=False):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.decr(key, value, noreply=noreply)
 
-    def touch(self, key, expire=0, noreply=None):
+    def touch(self, key: Key, expire: int = 0, noreply=None):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.touch(key, expire=expire, noreply=noreply)
 
@@ -1360,26 +1573,30 @@ class PooledClient(object):
                 else:
                     raise
 
-    def version(self):
+    def version(self) -> bytes:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.version()
 
-    def flush_all(self, delay=0, noreply=None):
+    def flush_all(self, delay=0, noreply=None) -> bool:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.flush_all(delay=delay, noreply=noreply)
 
-    def quit(self):
+    def quit(self) -> None:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             try:
                 client.quit()
             finally:
                 self.client_pool.destroy(client)
 
-    def shutdown(self, graceful=False):
+    def shutdown(self, graceful: bool = False) -> None:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             client.shutdown(graceful)
 
-    def __setitem__(self, key, value):
+    def raw_command(self, command, end_tokens=b"\r\n"):
+        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+            return client.raw_command(command, end_tokens)
+
+    def __setitem__(self, key: Key, value):
         self.set(key, value, noreply=True)
 
     def __getitem__(self, key):
@@ -1392,7 +1609,7 @@ class PooledClient(object):
         self.delete(key, noreply=True)
 
 
-def _readline(sock, buf):
+def _readline(sock: socket.socket, buf: bytes) -> Tuple[bytes, bytes]:
     """Read line of text from the socket.
 
     Read a line of text (delimited by "\r\n") from the socket, and
@@ -1401,19 +1618,19 @@ def _readline(sock, buf):
 
     Args:
         sock: Socket object, should be connected.
-        buf: String, zero or more characters, returned from an earlier
-            call to _readline or _readvalue (pass an empty string on the
+        buf: Bytes, zero or more characters, returned from an earlier
+            call to _readline or _readvalue (pass an empty byte string on the
             first call).
 
     Returns:
       A tuple of (buf, line) where line is the full line read from the
       socket (minus the "\r\n" characters) and buf is any trailing
       characters read after the "\r\n" was found (which may be an empty
-      string).
+      byte string).
 
     """
-    chunks = []
-    last_char = b''
+    chunks: List[bytes] = []
+    last_char = b""
 
     while True:
         # We're reading in chunks, so "\r\n" could appear in one chunk,
@@ -1422,14 +1639,17 @@ def _readline(sock, buf):
 
         # This case must appear first, since the buffer could have
         # later \r\n characters in it and we want to get the first \r\n.
-        if last_char == b'\r' and buf[0:1] == b'\n':
+        if last_char == b"\r" and buf[0:1] == b"\n":
             # Strip the last character from the last chunk.
             chunks[-1] = chunks[-1][:-1]
-            return buf[1:], b''.join(chunks)
-        elif buf.find(b'\r\n') != -1:
-            before, sep, after = buf.partition(b"\r\n")
-            chunks.append(before)
-            return after, b''.join(chunks)
+            return buf[1:], b"".join(chunks)
+        else:
+            token_pos = buf.find(b"\r\n")
+            if token_pos != -1:
+                # Note: 2 == len(b"\r\n")
+                before, after = buf[:token_pos], buf[token_pos + 2 :]
+                chunks.append(before)
+                return after, b"".join(chunks)
 
         if buf:
             chunks.append(buf)
@@ -1440,7 +1660,7 @@ def _readline(sock, buf):
             raise MemcacheUnexpectedCloseError()
 
 
-def _readvalue(sock, buf, size):
+def _readvalue(sock: socket.socket, buf: bytes, size: int):
     """Read specified amount of bytes from the socket.
 
     Read size bytes, followed by the "\r\n" characters, from the socket,
@@ -1480,16 +1700,54 @@ def _readvalue(sock, buf, size):
         chunks[-1] = chunks[-1][:-1]
     else:
         # Just remove the "\r\n" from the latest chunk
-        chunks.append(buf[:rlen - 2])
+        chunks.append(buf[: rlen - 2])
 
-    return buf[rlen:], b''.join(chunks)
+    return buf[rlen:], b"".join(chunks)
 
 
-def _recv(sock, size):
+def _readsegment(
+    sock: socket.socket, buf: bytes, end_tokens: bytes
+) -> Tuple[bytes, bytes]:
+    """Read a segment from the socket.
+
+    Read a segment from the socket, up to the first end_token sub-string/bytes,
+    and return that segment.
+
+    Args:
+        sock: Socket object, should be connected.
+        buf: bytes, zero or more bytes, returned from an earlier
+            call to _readline, _readsegment or _readvalue (pass an empty
+            byte-string on the first call).
+        end_tokens: bytes, indicates the end of the segment, generally this is
+            b"\\r\\n" for memcached.
+
+    Returns:
+      A tuple of (buf, line) where line is the full line read from the
+      socket (minus the end_tokens bytes) and buf is any trailing
+      characters read after the end_tokens was found (which may be an empty
+      bytes object).
+
+    """
+    result = bytes()
+
+    while True:
+
+        tokens_pos = buf.find(end_tokens)
+        if tokens_pos != -1:
+            before, after = buf[:tokens_pos], buf[tokens_pos + len(end_tokens) :]
+            result += before
+            return after, result
+
+        buf = _recv(sock, RECV_SIZE)
+        if not buf:
+            raise MemcacheUnexpectedCloseError()
+
+
+def _recv(sock: socket.socket, size: int) -> bytes:
     """sock.recv() with retry on EINTR"""
     while True:
         try:
             return sock.recv(size)
-        except IOError as e:
+        except OSError as e:
             if e.errno != errno.EINTR:
                 raise

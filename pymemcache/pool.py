@@ -14,34 +14,42 @@
 
 import collections
 import contextlib
-import sys
 import threading
 import time
+from typing import Callable, Optional, TypeVar, Deque, List, Generic, Iterator
 
-import six
+
+T = TypeVar("T")
 
 
-class ObjectPool(object):
+class ObjectPool(Generic[T]):
     """A pool of objects that release/creates/destroys as needed."""
 
-    def __init__(self, obj_creator,
-                 after_remove=None, max_size=None,
-                 idle_timeout=0,
-                 lock_generator=None):
-        self._used_objs = collections.deque()
-        self._free_objs = collections.deque()
+    def __init__(
+        self,
+        obj_creator: Callable[[], T],
+        after_remove: Optional[Callable] = None,
+        max_size: Optional[int] = None,
+        idle_timeout: int = 0,
+        lock_generator: Optional[Callable] = None,
+    ):
+        self._used_objs: Deque[T] = collections.deque()
+        self._free_objs: Deque[T] = collections.deque()
         self._obj_creator = obj_creator
         if lock_generator is None:
             self._lock = threading.Lock()
         else:
             self._lock = lock_generator()
         self._after_remove = after_remove
-        max_size = max_size or 2 ** 31
-        if not isinstance(max_size, six.integer_types) or max_size < 0:
+        max_size = max_size or 2**31
+        if not isinstance(max_size, int) or max_size < 0:
             raise ValueError('"max_size" must be a positive integer')
         self.max_size = max_size
         self.idle_timeout = idle_timeout
-        self._idle_clock = time.time if idle_timeout else int
+        if idle_timeout:
+            self._idle_clock = time.time
+        else:
+            self._idle_clock = float
 
     @property
     def used(self):
@@ -52,17 +60,16 @@ class ObjectPool(object):
         return tuple(self._free_objs)
 
     @contextlib.contextmanager
-    def get_and_release(self, destroy_on_fail=False):
+    def get_and_release(self, destroy_on_fail=False) -> Iterator[T]:
         obj = self.get()
         try:
             yield obj
         except Exception:
-            exc_info = sys.exc_info()
             if not destroy_on_fail:
                 self.release(obj)
             else:
                 self.destroy(obj)
-            six.reraise(exc_info[0], exc_info[1], exc_info[2])
+            raise
         self.release(obj)
 
     def get(self):
@@ -80,16 +87,16 @@ class ObjectPool(object):
                 # No free objects, create a new one.
                 curr_count = len(self._used_objs)
                 if curr_count >= self.max_size:
-                    raise RuntimeError("Too many objects,"
-                                       " %s >= %s" % (curr_count,
-                                                      self.max_size))
+                    raise RuntimeError(
+                        "Too many objects," " %s >= %s" % (curr_count, self.max_size)
+                    )
                 obj = self._obj_creator()
 
             self._used_objs.append(obj)
             obj._last_used = now
             return obj
 
-    def destroy(self, obj, silent=True):
+    def destroy(self, obj, silent=True) -> None:
         was_dropped = False
         with self._lock:
             try:
@@ -101,7 +108,7 @@ class ObjectPool(object):
         if was_dropped and self._after_remove is not None:
             self._after_remove(obj)
 
-    def release(self, obj, silent=True):
+    def release(self, obj, silent=True) -> None:
         with self._lock:
             try:
                 self._used_objs.remove(obj)
@@ -111,9 +118,9 @@ class ObjectPool(object):
                 if not silent:
                     raise
 
-    def clear(self):
+    def clear(self) -> None:
         if self._after_remove is not None:
-            needs_destroy = []
+            needs_destroy: List[T] = []
             with self._lock:
                 needs_destroy.extend(self._used_objs)
                 needs_destroy.extend(self._free_objs)

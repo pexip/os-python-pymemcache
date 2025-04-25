@@ -77,15 +77,56 @@ on if a server goes down.
     client.set('some_key', 'some value')
     result = client.get('some_key')
 
+Key distribution is handled by the ``hasher`` argument in the constructor. The
+default is the built-in :class:`pymemcache.client.rendezvous.RendezvousHash`
+hasher. It uses the built-in :class:`pymemcache.client.murmur3.murmur3_32`
+implementation to distribute keys on servers. Overriding these two parts can be
+used to change how keys are distributed. Changing the hashing algorithm can be
+done by setting the ``hash_function`` argument in the ``RendezvousHash``
+constructor.
+
+Rebalancing in the :class:`pymemcache.client.hash.HashClient` functions as
+follows:
+
+1. A :class:`pymemcache.client.hash.HashClient` is created with 3 nodes,
+   ``node1``, ``node2`` and ``node3``.
+2. A number of values are set in the client using ``set`` and ``set_many``.
+   Example:
+
+   - ``key1`` -> ``node2``
+   - ``key2`` -> ``node3``
+   - ``key3`` -> ``node3``
+   - ``key4`` -> ``node1``
+   - ``key5`` -> ``node2``
+
+3. Subsequent ``get`` calls will hash to the correct server and requests are routed
+   accordingly.
+4. ``node3`` goes down.
+5. The hashclient tries to ``get("key2")`` but detects the node as down. This
+   causes it to mark the node as down. Removing it from the hasher.
+   The hasclient can attempt to retry the operation based on the
+   ``retry_attempts`` and ``retry_timeout`` arguments.
+   If ``ignore_exc`` is set, this is treated as a miss, if not, an exception
+   will be raised.
+6. Any ``get``/``set`` for ``key2`` and ``key3`` will now hash differently,
+   example:
+
+   - ``key2`` -> ``node2``
+   - ``key3`` -> ``node1``
+
+7. After the amount of time specified in the ``dead_timeout`` argument,
+   ``node3`` is added back into the hasher and will be retried for any future
+   operations.
+
 Using the built-in retrying mechanism
 -------------------------------------
-The library comes with retry mechanisms that can be used to wrap all kind of
-pymemcache clients. The wrapper allow you to define the exceptions that you want
+The library comes with retry mechanisms that can be used to wrap all kinds of
+pymemcache clients. The wrapper allows you to define the exceptions that you want
 to handle with retries, which exceptions to exclude, how many attempts to make
 and how long to wait between attempts.
 
 The ``RetryingClient`` wraps around any of the other included clients and will
-have the same methods. For this example we're just using the base ``Client``.
+have the same methods. For this example, we're just using the base ``Client``.
 
 .. code-block:: python
 
@@ -209,10 +250,10 @@ For testing purpose pymemcache can be used in an interactive mode by using
 the python interpreter or again ipython and tools like tox.
 
 One main advantage of using `tox` to interact with `pymemcache` is that it
-comes with it's own virtual environments. It will automatically install
+comes with its own virtual environments. It will automatically install
 pymemcache and fetch all the needed requirements at run. See the example below:
 
-.. code-block:: shell
+.. code-block::
 
    $ podman run --publish 11211:11211 -it --rm --name memcached memcached
    $ tox -e venv -- python
@@ -233,8 +274,8 @@ pymemcache and fetch all the needed requirements at run. See the example below:
 You can instantiate all the classes and clients offered by pymemcache.
 
 Your client will remain open until you decide to close it or until you decide
-to quit your interpreter. It can allow you to see what's happen if your server
-is abruptly closed. Below is an by example.
+to quit your interpreter. It can allow you to see what happens if your server
+is abruptly closed. Below is an example.
 
 Starting your server:
 
@@ -258,7 +299,7 @@ Restarting the server:
 
    $ podman restart memcached
 
-The previous client is still opened, now try to retrieve some keys:
+The previous client is still open, now try to retrieve some keys:
 
 .. code-block:: shell
 

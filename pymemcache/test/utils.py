@@ -7,7 +7,6 @@ This module is considered public API.
 
 import time
 
-import six
 import socket
 
 from pymemcache.exceptions import MemcacheClientError, MemcacheIllegalInputError
@@ -15,26 +14,28 @@ from pymemcache.serde import LegacyWrappingSerde
 from pymemcache.client.base import check_key_helper
 
 
-class MockMemcacheClient(object):
+class MockMemcacheClient:
     """
     A (partial) in-memory mock for Clients.
 
     """
 
-    def __init__(self,
-                 server=None,
-                 serde=None,
-                 serializer=None,
-                 deserializer=None,
-                 connect_timeout=None,
-                 timeout=None,
-                 no_delay=False,
-                 ignore_exc=False,
-                 socket_module=None,
-                 default_noreply=True,
-                 allow_unicode_keys=False,
-                 encoding='ascii',
-                 tls_context=None):
+    def __init__(
+        self,
+        server=None,
+        serde=None,
+        serializer=None,
+        deserializer=None,
+        connect_timeout=None,
+        timeout=None,
+        no_delay=False,
+        ignore_exc=False,
+        socket_module=None,
+        default_noreply=True,
+        allow_unicode_keys=False,
+        encoding="ascii",
+        tls_context=None,
+    ):
 
         self._contents = {}
 
@@ -85,8 +86,7 @@ class MockMemcacheClient(object):
 
     def set(self, key, value, expire=0, noreply=True, flags=None):
         key = self.check_key(key)
-        if (isinstance(value, six.string_types) and
-                not isinstance(value, six.binary_type)):
+        if isinstance(value, str) and not isinstance(value, bytes):
             try:
                 value = value.encode(self.encoding)
             except (UnicodeEncodeError, UnicodeDecodeError):
@@ -102,7 +102,7 @@ class MockMemcacheClient(object):
 
     def set_many(self, values, expire=0, noreply=True, flags=None):
         result = []
-        for key, value in six.iteritems(values):
+        for key, value in values.items():
             ret = self.set(key, value, expire, noreply, flags=flags)
             if not ret:
                 result.append(key)
@@ -145,8 +145,7 @@ class MockMemcacheClient(object):
     def prepend(self, key, value, expire=0, noreply=True, flags=None):
         current = self.get(key)
         if current is not None:
-            if (isinstance(value, six.string_types) and
-                    not isinstance(value, six.binary_type)):
+            if isinstance(value, str) and not isinstance(value, bytes):
                 try:
                     value = value.encode(self.encoding)
                 except (UnicodeEncodeError, UnicodeDecodeError):
@@ -157,8 +156,7 @@ class MockMemcacheClient(object):
     def append(self, key, value, expire=0, noreply=True, flags=None):
         current = self.get(key)
         if current is not None:
-            if (isinstance(value, six.string_types) and
-                    not isinstance(value, six.binary_type)):
+            if isinstance(value, str) and not isinstance(value, bytes):
                 try:
                     value = value.encode(self.encoding)
                 except (UnicodeEncodeError, UnicodeDecodeError):
@@ -198,7 +196,7 @@ class MockMemcacheClient(object):
         return noreply or present
 
     def cas(self, key, value, cas, expire=0, noreply=False, flags=None):
-        raise MemcacheClientError('CAS is not enabled for this instance')
+        raise MemcacheClientError("CAS is not enabled for this instance")
 
     def touch(self, key, expire=0, noreply=True):
         current = self.get(key)
@@ -211,7 +209,7 @@ class MockMemcacheClient(object):
         return True
 
     def version(self):
-        return 'MockMemcacheClient'
+        return "MockMemcacheClient"
 
     def flush_all(self, delay=0, noreply=True):
         self.clear()

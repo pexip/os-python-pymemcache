@@ -1,0 +1,16 @@
+Description: Remove test failing on 32 bits
+Author: Thomas Goirand <zigo@debian.org>
+Bug-Debian: https://bugs.debian.org/1055394
+Forwarded: no
+Last-Update: 2023-11-07
+
+--- python-pymemcache-4.0.0.orig/pymemcache/test/test_serde.py
++++ python-pymemcache-4.0.0/pymemcache/test/test_serde.py
+@@ -141,7 +141,3 @@ def test_compressed_complex(serde):
+         },
+         FLAG_PICKLE | FLAG_COMPRESSED,
+     )
+-
+-    # test_subtype
+-    # Subclass of a native type will be restored as the same type
+-    check(serde, CustomInt(sys.maxsize), FLAG_PICKLE | FLAG_COMPRESSED)

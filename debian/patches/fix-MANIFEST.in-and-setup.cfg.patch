@@ -1,0 +1,39 @@
+Description: Fix MANIFEST.in and setup.cfg
+ Upstream Python packaging is broken in many ways, half implementing poetry.
+ Let's fix this.
+Author: Thomas Goirand <zigo@debian.org>
+Forwarded: no
+Last-Update: 2023-10-17
+
+--- python-pymemcache-4.0.0.orig/MANIFEST.in
++++ python-pymemcache-4.0.0/MANIFEST.in
+@@ -1,9 +1 @@
+-include README.* ChangeLog.* setup.py setup.cfg LICENSE.txt
+-include *-requirements.txt tox.ini
+-include pymemcache/py.typed
+-recursive-include pymemcache *.py
+-recursive-include pymemcache/test *.crt
+-recursive-include pymemcache/test *.key
+-recursive-include docs *.rst
+-global-exclude *.pyc
+-global-exclude *.pyo
++recursive-include pymemcache *
+--- python-pymemcache-4.0.0.orig/setup.cfg
++++ python-pymemcache-4.0.0/setup.cfg
+@@ -22,6 +22,7 @@ classifiers =
+ 
+ [options]
+ python_requires = >= 3.7
++packages = find:
+ 
+ [bdist_wheel]
+ universal = true
+--- a/pyproject.toml	2023-10-17 14:35:24.858450434 +0200
++++ /dev/null	2023-10-12 20:51:19.005135966 +0200
+@@ -1,6 +0,0 @@
+-[tool.black]
+-target-version = ['py37', 'py38', 'py39', 'py310']
+-
+-[tool.mypy]
+-python_version = 3.7
+-ignore_missing_imports = true
